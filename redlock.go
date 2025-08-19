@@ -1,0 +1,74 @@
+package redis_lock
+
+import (
+	"context"
+	"errors"
+	"time"
+)
+
+// 红锁每个节点默认处理超时时间 50ms
+const DefaultRedLockNodeTimeout = 50 * time.Millisecond
+
+type RedLock struct {
+	locks []*RedisLock
+	RedLockOptions
+}
+
+func NewRedLock(key string, confs []*SingleNodeConfig, opts ...RedLockOption) (*RedLock, error) {
+	// 3 个节点以上，红锁才有意义
+	if len(confs) < 3 {
+		return nil, errors.New("redlock requires at least 3 nodes")
+	}
+
+	r := RedLock{}
+
+	for _, opt := range opts {
+		opt(&r.RedLockOptions)
+	}
+
+	repairRedLock(&r.RedLockOptions)
+
+	if r.expireDuration > 0 && time.Duration(len(confs))* r.singleNodeTimeout * 10 > r.expireDuration {
+		// 要求所有节点累计的超时阈值要小于分布式锁过期时间的十分之一
+		return nil, errors.New("expire duration is too short")
+	}
+
+	r.locks = make([]*RedisLock, len(confs))
+	for _, conf := range confs {
+		client := NewClient(conf.Network, conf.Address, conf.Password, conf.Opts...)
+		r.locks = append(r.locks, NewRedisLock(key, client, WithExpireSeconds(int64(r.expireDuration.Seconds()))))
+	}
+
+	return &r, nil
+}
+
+func (r *RedLock) Lock(ctx context.Context) error {
+	var successCnt int
+	for _, lock := range r.locks {
+		startTime := time.Now()
+		err := lock.Lock(ctx)
+		cost := time.Since(startTime)
+		if err == nil  && cost <= r.singleNodeTimeout{
+			successCnt++
+		}
+	}
+
+	if successCnt < len(r.locks)/2+1 {
+		return errors.New("redlock failed")
+	}
+
+	return nil
+}
+
+// 解锁时，对所有的节点广播解锁
+func (r *RedLock) Unlock(ctx context.Context) error {
+	var err error 
+	for _, lock := range r.locks {
+		if _err := lock.Unlock(ctx); _err != nil {
+			if err == nil {
+				err = _err
+			}
+		}
+	}
+	return err
+}
